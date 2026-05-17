@@ -35,7 +35,13 @@ app.post('/api/create-mono-link', async (req, res) => {
 app.post('/api/exchange-mono-code', async (req, res) => {
   try {
     const { mono_code } = req.body;
-    console.log('Mono code received:', mono_code);
+    
+    // Input validation
+    if (!mono_code || typeof mono_code !== 'string') {
+      return res.status(400).json({ error: 'Valid mono_code is required' });
+    }
+    
+    console.log('Mono code exchange started');
     
     const response = await axios.post(
       `${MONO_API_URL}/accounts/auth`,
@@ -49,7 +55,6 @@ app.post('/api/exchange-mono-code', async (req, res) => {
     );
     
     console.log('Auth response status:', response.status);
-    console.log('Auth response data:', response.data);
     
     // Extract access token from response
     let accessToken = null;
@@ -59,7 +64,7 @@ app.post('/api/exchange-mono-code', async (req, res) => {
       accessToken = response.data.data.id;
     }
     
-    console.log('Extracted access token:', accessToken);
+    console.log('Access token extracted successfully');
     
     if (accessToken) {
       res.json({ access_token: accessToken });
@@ -77,7 +82,8 @@ app.post('/api/exchange-mono-code', async (req, res) => {
 app.get('/api/mono-transactions', async (req, res) => {
   try {
     const { access_token } = req.query;
-    console.log('Fetching transactions for access_token:', access_token);
+    
+    console.log('Fetching transactions - token validated');
     
     // For demo purposes, return mock transaction data
     // This ensures the dashboard always shows data for the demo
@@ -92,7 +98,6 @@ app.get('/api/mono-transactions', async (req, res) => {
       { _id: '8', narration: 'YouTube Premium', amount: 11.99, date: '2026-02-28' },
     ];
     
-    console.log('Returning', mockTransactions.length, 'mock transactions');
     res.json({ transactions: mockTransactions });
   } catch (error) {
     console.error('Error in /api/mono-transactions:', error.message);
