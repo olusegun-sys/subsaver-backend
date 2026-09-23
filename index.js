@@ -46,14 +46,14 @@ app.post('/api/create-mono-link', async (req, res) => {
 app.post('/api/exchange-mono-code', async (req, res) => {
   try {
     const { mono_code } = req.body;
-    
+
     // Input validation
     if (!mono_code || typeof mono_code !== 'string') {
       return res.status(400).json({ error: 'Valid mono_code is required' });
     }
-    
+
     console.log('Mono code exchange started');
-    
+
     const response = await axios.post(
       `${MONO_API_URL}/accounts/auth`,
       { code: mono_code },
@@ -64,9 +64,9 @@ app.post('/api/exchange-mono-code', async (req, res) => {
         },
       }
     );
-    
+
     console.log('Auth response status:', response.status);
-    
+
     // Extract access token from response
     let accessToken = null;
     if (response.data.id) {
@@ -74,9 +74,9 @@ app.post('/api/exchange-mono-code', async (req, res) => {
     } else if (response.data.data && response.data.data.id) {
       accessToken = response.data.data.id;
     }
-    
+
     console.log('Access token extracted successfully');
-    
+
     if (accessToken) {
       res.json({ access_token: accessToken });
     } else {
@@ -93,11 +93,10 @@ app.post('/api/exchange-mono-code', async (req, res) => {
 app.get('/api/mono-transactions', async (req, res) => {
   try {
     const { access_token } = req.query;
-    
+
     console.log('Fetching transactions - token validated');
-    
+
     // For demo purposes, return mock transaction data
-    // This ensures the dashboard always shows data for the demo
     const mockTransactions = [
       { _id: '1', narration: 'Netflix', amount: 15.99, date: '2026-03-25' },
       { _id: '2', narration: 'Spotify', amount: 9.99, date: '2026-03-20' },
@@ -108,11 +107,10 @@ app.get('/api/mono-transactions', async (req, res) => {
       { _id: '7', narration: 'HBO Max', amount: 14.99, date: '2025-11-20' },
       { _id: '8', narration: 'YouTube Premium', amount: 11.99, date: '2026-02-28' },
     ];
-    
+
     res.json({ transactions: mockTransactions });
   } catch (error) {
     console.error('Error in /api/mono-transactions:', error.message);
-    // Always return something so the UI doesn't break
     const fallbackTransactions = [
       { _id: '1', narration: 'Netflix', amount: 15.99, date: '2026-03-25' },
       { _id: '2', narration: 'Spotify', amount: 9.99, date: '2026-03-20' },
@@ -125,13 +123,20 @@ app.get('/api/mono-transactions', async (req, res) => {
 // WHY: Verifies a Paystack payment and marks the user as Premium in Supabase.
 // This route is the SINGLE source of truth for premium activation — the
 // frontend cannot grant premium on its own.
+// Supports two tiers: 'monthly' (₦3,500 = 350000 kobo) and 'annual' (₦25,000 = 2500000 kobo).
 app.post('/api/verify-payment', async (req, res) => {
   try {
-    const { reference } = req.body;
+    const { reference, tier } = req.body;
 
     // WHY: Input validation — reject anything that isn't a proper string.
     if (!reference || typeof reference !== 'string' || reference.length < 6) {
       return res.status(400).json({ success: false, error: 'Valid payment reference is required' });
+    }
+
+    // WHY: Validate tier — only allow 'monthly' or 'annual'.
+    // Prevents client-side spoofing of arbitrary tier values.
+    if (tier !== 'monthly' && tier !== 'annual') {
+      return res.status(400).json({ success: false, error: 'Invalid subscription tier' });
     }
 
     // WHY: Extract the user's auth token from the Authorization header.
@@ -158,11 +163,9 @@ app.post('/api/verify-payment', async (req, res) => {
       .maybeSingle();
 
     if (existing) {
-      // WHY: If the same user re-verifies the same reference, treat as success (idempotent).
       if (existing.user_id === user.id && existing.is_premium) {
         return res.json({ success: true, message: 'Already verified' });
       }
-      // WHY: If the reference is used by a DIFFERENT user, this is a fraud attempt.
       return res.status(409).json({ success: false, error: 'Payment reference already used' });
     }
 
@@ -182,10 +185,20 @@ app.post('/api/verify-payment', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Payment not successful' });
     }
 
-    // WHY: Confirm the amount matches ₦3,500 (Paystack uses kobo — 350000 kobo = ₦3,500).
-    // Prevents someone paying ₦1 and getting premium.
-    if (payment.amount !== 350000) {
-      return res.status(400).json({ success: false, error: 'Payment amount mismatch' });
+    // WHY: Expected amount depends on tier. Both checks below prevent underpayment.
+    // monthly = ₦3,500 = 350000 kobo | annual = ₦25,000 = 2500000 kobo
+    const expectedAmount = tier === 'annual' ? 2500000 : 350000;
+    if (payment.amount !== expectedAmount) {
+      return res.status(400).json({ success: false, error: 'Payment amount mismatch for tier' });
+    }
+
+    // WHY: Compute expiry — monthly = 30 days, annual = 365 days.
+    const now = new Date();
+    const expiry = new Date(now);
+    if (tier === 'annual') {
+      expiry.setDate(expiry.getDate() + 365);
+    } else {
+      expiry.setDate(expiry.getDate() + 30);
     }
 
     // WHY: All checks passed. Upsert into user_premium — makes this user Premium.
@@ -195,7 +208,9 @@ app.post('/api/verify-payment', async (req, res) => {
         {
           user_id: user.id,
           is_premium: true,
-          premium_since: new Date().toISOString(),
+          premium_since: now.toISOString(),
+          premium_expires_at: expiry.toISOString(),
+          premium_tier: tier,
           payment_reference: reference,
         },
         { onConflict: 'user_id' }
@@ -206,7 +221,7 @@ app.post('/api/verify-payment', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Failed to activate premium' });
     }
 
-    return res.json({ success: true, message: 'Premium activated' });
+    return res.json({ success: true, message: 'Premium activated', tier });
   } catch (error) {
     // WHY: User-friendly error message — never leak internal details.
     console.error('Error verifying payment:', error.response?.data || error.message);
