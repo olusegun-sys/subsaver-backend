@@ -1,7 +1,8 @@
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -10,6 +11,16 @@ app.use(cors());
 app.use(express.json());
 
 const MONO_API_URL = 'https://api.withmono.com/v2';
+
+// WHY: Admin Supabase client using the service_role key. This bypasses RLS
+// so the backend can write to user_premium. NEVER expose this key to frontend.
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: { persistSession: false, autoRefreshToken: false }
+  }
+);
 
 // Create Mono link
 app.post('/api/create-mono-link', async (req, res) => {
@@ -111,6 +122,98 @@ app.get('/api/mono-transactions', async (req, res) => {
   }
 });
 
+// WHY: Verifies a Paystack payment and marks the user as Premium in Supabase.
+// This route is the SINGLE source of truth for premium activation — the
+// frontend cannot grant premium on its own.
+app.post('/api/verify-payment', async (req, res) => {
+  try {
+    const { reference } = req.body;
+
+    // WHY: Input validation — reject anything that isn't a proper string.
+    if (!reference || typeof reference !== 'string' || reference.length < 6) {
+      return res.status(400).json({ success: false, error: 'Valid payment reference is required' });
+    }
+
+    // WHY: Extract the user's auth token from the Authorization header.
+    // This is CRITICAL — we must NEVER trust the frontend to tell us who the user is.
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'Missing authentication token' });
+    }
+
+    // WHY: Verify the token with Supabase and get the authenticated user.
+    const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
+
+    if (authError || !user) {
+      return res.status(401).json({ success: false, error: 'Invalid or expired authentication' });
+    }
+
+    // WHY: Check if this reference is already used. Prevents replay attacks.
+    const { data: existing } = await supabaseAdmin
+      .from('user_premium')
+      .select('user_id, is_premium')
+      .eq('payment_reference', reference)
+      .maybeSingle();
+
+    if (existing) {
+      // WHY: If the same user re-verifies the same reference, treat as success (idempotent).
+      if (existing.user_id === user.id && existing.is_premium) {
+        return res.json({ success: true, message: 'Already verified' });
+      }
+      // WHY: If the reference is used by a DIFFERENT user, this is a fraud attempt.
+      return res.status(409).json({ success: false, error: 'Payment reference already used' });
+    }
+
+    // WHY: Call Paystack to verify the payment actually happened.
+    const paystackRes = await axios.get(
+      `https://api.paystack.co/transaction/verify/${reference}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        },
+      }
+    );
+
+    const payment = paystackRes.data?.data;
+
+    if (!payment || payment.status !== 'success') {
+      return res.status(400).json({ success: false, error: 'Payment not successful' });
+    }
+
+    // WHY: Confirm the amount matches ₦3,500 (Paystack uses kobo — 350000 kobo = ₦3,500).
+    // Prevents someone paying ₦1 and getting premium.
+    if (payment.amount !== 350000) {
+      return res.status(400).json({ success: false, error: 'Payment amount mismatch' });
+    }
+
+    // WHY: All checks passed. Upsert into user_premium — makes this user Premium.
+    const { error: upsertError } = await supabaseAdmin
+      .from('user_premium')
+      .upsert(
+        {
+          user_id: user.id,
+          is_premium: true,
+          premium_since: new Date().toISOString(),
+          payment_reference: reference,
+        },
+        { onConflict: 'user_id' }
+      );
+
+    if (upsertError) {
+      console.error('Error upserting premium:', upsertError);
+      return res.status(500).json({ success: false, error: 'Failed to activate premium' });
+    }
+
+    return res.json({ success: true, message: 'Premium activated' });
+  } catch (error) {
+    // WHY: User-friendly error message — never leak internal details.
+    console.error('Error verifying payment:', error.response?.data || error.message);
+    res.status(500).json({ success: false, error: 'Verification failed. Please try again.' });
+  }
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
@@ -121,4 +224,6 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Mono API URL: ${MONO_API_URL}`);
   console.log(`Mono Secret Key set: ${process.env.MONO_SECRET_KEY ? 'Yes' : 'No'}`);
+  console.log(`Paystack Secret Key set: ${process.env.PAYSTACK_SECRET_KEY ? 'Yes' : 'No'}`);
+  console.log(`Supabase Admin configured: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Yes' : 'No'}`);
 });
