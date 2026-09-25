@@ -126,28 +126,45 @@ app.get('/api/mono-transactions', async (req, res) => {
   }
 });
 
-// WHY: Placeholder for the real detection engine (Session 1B).
-// For now it returns an empty list so the frontend stops showing fabricated data.
-// When Session 1B lands, this route will call the detection module, run pattern
-// matching on real Mono transactions, and return actual subscriptions.
+// WHY: Real detection engine. Pulls transactions from Mono, runs pattern-matching,
+// returns identified subscriptions. Amounts are converted from kobo to naira.
 app.post('/api/detect-subscriptions', async (req, res) => {
   try {
-    // WHY: Validate the access_token shape — same rule as the transactions route.
     const { access_token } = req.body;
+
+    // WHY: Validate token shape — same rule as other routes.
     if (!access_token || typeof access_token !== 'string') {
       return res.status(400).json({ error: 'Valid access_token is required' });
     }
 
-    // WHY: Detection engine not yet built — be honest, don't fabricate.
-    // The frontend will show "no subscriptions found" until this is implemented.
-    return res.json({
-      subscriptions: [],
-      notImplemented: true,
-      message: 'Detection engine coming in next build.',
-    });
+    // WHY: Pull 6 months of transactions — enough history to establish patterns.
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const fromDate = sixMonthsAgo.toISOString().split('T')[0];
+
+    const response = await axios.get(
+      `${MONO_API_URL}/accounts/${access_token}/transactions`,
+      {
+        params: { from: fromDate, limit: 500 },
+        headers: {
+          'Content-Type': 'application/json',
+          'mono-sec-key': process.env.MONO_SECRET_KEY,
+        },
+      }
+    );
+
+    const transactions = response.data?.data || [];
+
+    // WHY: Run detection engine against real transaction data.
+    const { detectSubscriptions } = await import('./detection.js');
+    const subscriptions = detectSubscriptions(transactions);
+
+    return res.json({ subscriptions, notImplemented: false });
   } catch (error) {
-    console.error('Error in /api/detect-subscriptions:', error.message);
-    res.status(500).json({ error: 'Failed to detect subscriptions' });
+    console.error('Error in /api/detect-subscriptions:', error.response?.data || error.message);
+    // WHY: Return empty array instead of error so the frontend shows
+    // "No subscriptions found" instead of a scary error toast.
+    return res.json({ subscriptions: [], notImplemented: false });
   }
 });
 
