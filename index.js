@@ -89,34 +89,65 @@ app.post('/api/exchange-mono-code', async (req, res) => {
   }
 });
 
-// Get transactions - returns mock data with older dates for flagged demo
+// WHY: Real Mono transactions route. Pulls the actual transaction history for a
+// connected account. Replaces the previous mock data.
+// NOTE: This is NOT yet wired to detection — Session 1B adds the pattern matcher.
 app.get('/api/mono-transactions', async (req, res) => {
   try {
+    // WHY: access_token identifies which connected bank account to read from.
     const { access_token } = req.query;
 
-    console.log('Fetching transactions - token validated');
+    // WHY: Reject missing/malformed tokens early — prevents an empty call to Mono.
+    if (!access_token || typeof access_token !== 'string') {
+      return res.status(400).json({ error: 'Valid access_token is required' });
+    }
 
-    // For demo purposes, return mock transaction data
-    const mockTransactions = [
-      { _id: '1', narration: 'Netflix', amount: 15.99, date: '2026-03-25' },
-      { _id: '2', narration: 'Spotify', amount: 9.99, date: '2026-03-20' },
-      { _id: '3', narration: 'Adobe Creative Cloud', amount: 52.99, date: '2026-01-15' },
-      { _id: '4', narration: 'Amazon Prime', amount: 14.99, date: '2026-02-10' },
-      { _id: '5', narration: 'Apple Music', amount: 10.99, date: '2026-01-05' },
-      { _id: '6', narration: 'Disney+', amount: 11.99, date: '2025-12-15' },
-      { _id: '7', narration: 'HBO Max', amount: 14.99, date: '2025-11-20' },
-      { _id: '8', narration: 'YouTube Premium', amount: 11.99, date: '2026-02-28' },
-    ];
+    // WHY: Real call to Mono's transactions endpoint. Returns real bank data
+    // in test mode (from your Mono sandbox accounts) or live mode.
+    const response = await axios.get(
+      `${MONO_API_URL}/accounts/${access_token}/transactions`,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'mono-sec-key': process.env.MONO_SECRET_KEY, // WHY: Auth for Mono's API — server-side only.
+        },
+      }
+    );
 
-    res.json({ transactions: mockTransactions });
+    // WHY: Mono wraps results in `data`. Pass through only what we need.
+    const transactions = response.data?.data || [];
+
+    res.json({ transactions });
   } catch (error) {
-    console.error('Error in /api/mono-transactions:', error.message);
-    const fallbackTransactions = [
-      { _id: '1', narration: 'Netflix', amount: 15.99, date: '2026-03-25' },
-      { _id: '2', narration: 'Spotify', amount: 9.99, date: '2026-03-20' },
-      { _id: '3', narration: 'Adobe Creative Cloud', amount: 52.99, date: '2026-01-15' },
-    ];
-    res.json({ transactions: fallbackTransactions });
+    // WHY: Log Mono's actual error for debugging, but return a generic message
+    // so we never leak API details to the frontend.
+    console.error('Error fetching Mono transactions:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+// WHY: Placeholder for the real detection engine (Session 1B).
+// For now it returns an empty list so the frontend stops showing fabricated data.
+// When Session 1B lands, this route will call the detection module, run pattern
+// matching on real Mono transactions, and return actual subscriptions.
+app.post('/api/detect-subscriptions', async (req, res) => {
+  try {
+    // WHY: Validate the access_token shape — same rule as the transactions route.
+    const { access_token } = req.body;
+    if (!access_token || typeof access_token !== 'string') {
+      return res.status(400).json({ error: 'Valid access_token is required' });
+    }
+
+    // WHY: Detection engine not yet built — be honest, don't fabricate.
+    // The frontend will show "no subscriptions found" until this is implemented.
+    return res.json({
+      subscriptions: [],
+      notImplemented: true,
+      message: 'Detection engine coming in next build.',
+    });
+  } catch (error) {
+    console.error('Error in /api/detect-subscriptions:', error.message);
+    res.status(500).json({ error: 'Failed to detect subscriptions' });
   }
 });
 
