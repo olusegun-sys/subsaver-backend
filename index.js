@@ -2,13 +2,23 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// WHY: Capture the raw request body alongside parsing it. Paystack signs the
+// raw bytes with HMAC-SHA512 — if we only have the parsed JSON, we cannot
+// verify the signature. This stores the raw bytes on req.rawBody for the
+// webhook route to use. Other routes ignore this — zero impact on them.
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 
 const MONO_API_URL = 'https://api.withmono.com/v2';
 
@@ -91,7 +101,6 @@ app.post('/api/exchange-mono-code', async (req, res) => {
 
 // WHY: Real Mono transactions route. Pulls the actual transaction history for a
 // connected account. Replaces the previous mock data.
-// NOTE: This is NOT yet wired to detection — Session 1B adds the pattern matcher.
 app.get('/api/mono-transactions', async (req, res) => {
   try {
     // WHY: access_token identifies which connected bank account to read from.
@@ -109,7 +118,7 @@ app.get('/api/mono-transactions', async (req, res) => {
       {
         headers: {
           'Content-Type': 'application/json',
-          'mono-sec-key': process.env.MONO_SECRET_KEY, // WHY: Auth for Mono's API — server-side only.
+          'mono-sec-key': process.env.MONO_SECRET_KEY,
         },
       }
     );
@@ -169,8 +178,8 @@ app.post('/api/detect-subscriptions', async (req, res) => {
 });
 
 // WHY: Verifies a Paystack payment and marks the user as Premium in Supabase.
-// This route is the SINGLE source of truth for premium activation — the
-// frontend cannot grant premium on its own.
+// This route is the PRIMARY source of truth for premium activation — the
+// frontend calls it after Paystack redirects the user back.
 // Supports two tiers: 'monthly' (₦3,500 = 350000 kobo) and 'annual' (₦25,000 = 2500000 kobo).
 app.post('/api/verify-payment', async (req, res) => {
   try {
@@ -274,6 +283,132 @@ app.post('/api/verify-payment', async (req, res) => {
     // WHY: User-friendly error message — never leak internal details.
     console.error('Error verifying payment:', error.response?.data || error.message);
     res.status(500).json({ success: false, error: 'Verification failed. Please try again.' });
+  }
+});
+
+// WHY: Paystack webhook — the BACKUP activation path.
+// If the user closes their browser before the callback fires (or their network
+// dies), /api/verify-payment never runs. Paystack then sends this webhook
+// DIRECTLY to our server. Handles the same activation logic — idempotent.
+app.post('/api/paystack-webhook', async (req, res) => {
+  try {
+    // WHY: Paystack sends the signature in this header. Must be lowercase.
+    const signature = req.headers['x-paystack-signature'];
+
+    if (!signature) {
+      return res.status(401).send('Missing signature');
+    }
+
+    // WHY: Verify the signature using HMAC-SHA512 and the RAW body.
+    // Paystack uses your Secret Key as the HMAC secret — no separate webhook secret.
+    const expectedHash = crypto
+      .createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+      .update(req.rawBody)
+      .digest('hex');
+
+    // WHY: Constant-time comparison prevents timing attacks.
+    // If hashes don't match, someone is faking the webhook — reject immediately.
+    const sigBuffer = Buffer.from(signature, 'hex');
+    const expectedBuffer = Buffer.from(expectedHash, 'hex');
+    if (sigBuffer.length !== expectedBuffer.length ||
+        !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+      console.error('[webhook] Invalid signature');
+      return res.status(401).send('Invalid signature');
+    }
+
+    // WHY: Respond 200 IMMEDIATELY. Paystack retries if we take >5 seconds.
+    // We do the DB work AFTER responding — this is the correct pattern.
+    res.sendStatus(200);
+
+    // WHY: Parse the raw body now that signature is verified.
+    const event = JSON.parse(req.rawBody.toString());
+
+    // WHY: We only care about successful charges. Ignore everything else.
+    if (event.event !== 'charge.success') {
+      return;
+    }
+
+    const data = event.data;
+    const reference = data.reference;
+    const amount = data.amount;         // In kobo
+    const email = data.customer?.email; // Used to look up user if needed
+
+    // WHY: Determine tier from amount. Anything else is suspicious — skip.
+    let tier = null;
+    if (amount === 350000) tier = 'monthly';
+    else if (amount === 2500000) tier = 'annual';
+    else {
+      console.error(`[webhook] Unknown amount: ${amount} for ref ${reference}`);
+      return;
+    }
+
+    // WHY: Idempotency check — if this reference is already in user_premium,
+    // the frontend callback already handled it. Nothing to do.
+    const { data: existing } = await supabaseAdmin
+      .from('user_premium')
+      .select('user_id, payment_reference')
+      .eq('payment_reference', reference)
+      .maybeSingle();
+
+    if (existing) {
+      console.log(`[webhook] Reference ${reference} already processed`);
+      return;
+    }
+
+    // WHY: We need the user_id. The frontend callback path derives it from JWT.
+    // The webhook has no JWT — only the customer's email. So we look up the user.
+    const { data: { users }, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+    if (listError) {
+      console.error('[webhook] Failed to list users:', listError);
+      return;
+    }
+
+    const matchedUser = users.find(u => u.email === email);
+    if (!matchedUser) {
+      console.error(`[webhook] No user found for email ${email}`);
+      return;
+    }
+
+    // WHY: Compute expiry same way as /api/verify-payment. Keep both paths consistent.
+    const now = new Date();
+    const expiry = new Date(now);
+    if (tier === 'annual') {
+      expiry.setDate(expiry.getDate() + 365);
+    } else {
+      expiry.setDate(expiry.getDate() + 30);
+    }
+
+    // WHY: Upsert into user_premium — same shape as verify-payment route.
+    // If the user already exists, update. If not, insert.
+    const { error: upsertError } = await supabaseAdmin
+      .from('user_premium')
+      .upsert(
+        {
+          user_id: matchedUser.id,
+          is_premium: true,
+          premium_since: now.toISOString(),
+          premium_expires_at: expiry.toISOString(),
+          premium_tier: tier,
+          payment_reference: reference,
+        },
+        { onConflict: 'user_id' }
+      );
+
+    if (upsertError) {
+      console.error('[webhook] Upsert failed:', upsertError);
+      return;
+    }
+
+    console.log(`[webhook] Premium activated via webhook for ${email} (${tier})`);
+  } catch (error) {
+    // WHY: Log everything for debugging, but never crash. Paystack already
+    // got a 200 if we got this far. If we crashed before 200, log it.
+    console.error('[webhook] Error:', error.message);
+    // WHY: If we haven't sent a response yet, send 200 so Paystack stops retrying.
+    // Duplicate retries are handled by the idempotency check above.
+    if (!res.headersSent) {
+      res.sendStatus(200);
+    }
   }
 });
 
