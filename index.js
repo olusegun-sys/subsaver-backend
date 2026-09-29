@@ -8,7 +8,35 @@ import { createClient } from '@supabase/supabase-js';
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+// WHY: Explicit CORS config instead of default `cors()`. The default reflects the
+// incoming Origin header — but behind Render's proxy, the preflight OPTIONS request
+// can arrive without that header, so the response ends up missing
+// Access-Control-Allow-Origin. An allowlist guarantees the header is always set.
+const ALLOWED_ORIGINS = [
+  'https://subsaver-frontend.onrender.com',
+  'http://localhost:5173',
+  'http://localhost:3000',
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // WHY: Allow requests with no Origin (curl, Postman, server-to-server).
+    if (!origin) return callback(null, true);
+    // WHY: Allow only our known frontends.
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    // WHY: Log rejections so future CORS issues are easy to debug.
+    console.warn('[CORS] Blocked origin:', origin);
+    callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+
+// WHY: Express doesn't always auto-respond to OPTIONS. This guarantees every
+// preflight request gets a 200 with the CORS headers attached.
+app.options('*', cors());
 
 // WHY: Capture the raw request body alongside parsing it. Paystack signs the
 // raw bytes with HMAC-SHA512 — if we only have the parsed JSON, we cannot
